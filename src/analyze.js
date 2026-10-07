@@ -5,6 +5,7 @@ const { rules: allRules } = require('./rules');
 
 const SEVERITIES = ['info', 'low', 'medium', 'high'];
 const DIRECTIVE = /bughunter-disable-(next-line|line)\b([^\n]*)/;
+const LINE_BREAK = /\r\n?|\n/;
 
 function severityRank(severity) {
   return SEVERITIES.indexOf(severity);
@@ -30,10 +31,19 @@ function parseDirectives(rawLines) {
   return disabled;
 }
 
+// TypeScript-only files cannot contain JSX, and `<T>expr` casts there look like JSX.
+function allowsJsx(file) {
+  return !/\.(?:d\.)?[cm]?ts$/i.test(file);
+}
+
 function analyzeSource(text, { file = '<input>', disabledRules = [] } = {}) {
-  const { withStrings, code } = mask(text);
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const { withStrings, code } = mask(text, { jsx: allowsJsx(file) });
+
   const lineStarts = [0];
-  for (let i = 0; i < code.length; i++) if (code[i] === '\n') lineStarts.push(i + 1);
+  const breaks = new RegExp(LINE_BREAK.source, 'g');
+  let b;
+  while ((b = breaks.exec(code)) !== null) lineStarts.push(b.index + b[0].length);
 
   const posOf = (offset) => {
     let lo = 0;
@@ -46,12 +56,13 @@ function analyzeSource(text, { file = '<input>', disabledRules = [] } = {}) {
     return { line: lo + 1, column: offset - lineStarts[lo] + 1 };
   };
 
-  const split = (s) => s.split(/\r?\n/);
+  const split = (s) => s.split(LINE_BREAK);
   const rawLines = split(text);
   const ctx = {
     file,
     raw: text,
     rawLines,
+    str: withStrings,
     strLines: split(withStrings),
     code,
     codeLines: split(code),
