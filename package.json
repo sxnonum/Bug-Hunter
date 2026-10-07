@@ -1,0 +1,13 @@
+{
+  "name": "bug-hunter",
+  "version": "0.1.0",
+  "description": "Zero-dependency static analyzer that hunts for common bugs and risky patterns in JavaScript/TypeScript",
+  "bin": { "bughunter": "bin/bughunter.js" },
+  "main": "src/analyze.js",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "scan": "node bin/bughunter.js src bin"
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
