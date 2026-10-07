@@ -20,15 +20,39 @@ node bin/bughunter.js [options] [path...]     # or `bughunter` once installed (n
 
 | Option | Description |
 |---|---|
-| `--format <text\|json>` | Output format (default `text`) |
-| `--min-severity <level>` | Hide findings below `info`, `low`, `medium` or `high` (default `info`) |
-| `--fail-on <level>` | Exit with code 1 if any finding is at or above this level (default `medium`) |
+| `--format <text\|json\|sarif>` | Output format (default `text`). `sarif` is SARIF 2.1.0 for code-scanning tools |
+| `--min-severity <level>` | Hide findings below `info`, `low`, `medium` or `high` (default `info`). Only affects what is printed, not the exit code |
+| `--fail-on <level>` | Exit with code 1 if any finding is at or above this level (default `medium`). Counts every finding, including ones hidden by `--min-severity` |
 | `--disable <rules>` | Comma-separated rule ids to skip |
+| `--include-minified` | Also scan minified/bundled files, which are skipped by default |
+| `--config <path>` | Read options from a JSON file (default: `.bughunterrc.json` in the current directory, if present) |
 | `--list-rules` | Print all rules |
 
-Exit codes: `0` clean, `1` findings at or above `--fail-on`, `2` usage error.
+Exit codes: `0` clean, `1` findings at or above `--fail-on`, `2` usage error or a file/directory that could not be scanned. `2` takes precedence over `1`, so CI can tell a broken scan from a failing one. Problems are printed to stderr as `bughunter: <file>: <message>` and the remaining files are still scanned.
 
-Scans `.js .mjs .cjs .jsx .ts .tsx` files, skipping `node_modules`, `.git`, `dist`, `build`, `coverage` and files over 1 MB.
+Scans `.js .mjs .cjs .jsx .ts .mts .cts .tsx` files (case-insensitive), skipping `node_modules`, `.git`, `dist`, `build`, `coverage` and `.next`. Symlinks to files and directories are followed (loops are detected, and a file reachable twice is scanned once, even if you name overlapping paths); a dangling symlink is an error. Some files are skipped and listed under `skipped` in the JSON output, with a note on stderr:
+
+| Reason | When |
+|---|---|
+| `too-large` | the file is over 1 MB |
+| `minified` | the name matches `*.min.js` (also `.mjs`/`.cjs`), or any line is longer than 5000 characters; use `--include-minified` to scan them |
+| `binary` | the file contains NUL bytes (this includes UTF-16 files) |
+| `not-a-regular-file` | a FIFO, device or similar |
+
+### Config file
+
+`.bughunterrc.json` in the current directory (or the file given with `--config`) sets defaults; command-line flags override it.
+
+```json
+{
+  "disable": ["todo-marker"],
+  "minSeverity": "low",
+  "failOn": "high",
+  "exclude": ["fixtures", "**/*.generated.js", "lib/legacy/*.js"]
+}
+```
+
+`exclude` takes plain file or directory names (matched anywhere), or globs relative to each scanned directory, where `*` matches within one path segment, `**` across segments and `?` one character. An excluded directory is skipped whole. Files named explicitly on the command line are always scanned. Unknown keys and invalid values exit with code 2.
 
 ### Suppressing a finding
 

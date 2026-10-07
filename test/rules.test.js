@@ -9,7 +9,7 @@ const has = (src, rule) => ids(src).includes(rule);
 
 test('no-eval flags eval and new Function but not methods or strings', () => {
   assert.ok(has('eval(input);', 'no-eval'));
-  assert.ok(has('const f = new Function("return 1");', 'no-eval'));
+  assert.ok(has('const f = new Function("a", body);', 'no-eval'));
   assert.ok(!has('page.eval(x);', 'no-eval'));
   assert.ok(!has('const s = "eval(x)"; // eval(y)', 'no-eval'));
 });

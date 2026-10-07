@@ -1,8 +1,14 @@
 'use strict';
 
 const path = require('node:path');
+const { rules } = require('./rules');
+const { version } = require('../package.json');
 
-function formatText(findings, { filesScanned }, { color = false } = {}) {
+const SARIF_LEVEL = { high: 'error', medium: 'warning', low: 'note', info: 'note' };
+
+// `hidden` = findings removed by --min-severity; `hiddenFailing` says whether any of them
+// is at or above --fail-on (and so still decides the exit code).
+function formatText(findings, { filesScanned }, { color = false, hidden = 0, hiddenFailing = false } = {}) {
   const paint = (code, s) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
   const sevColor = { high: 31, medium: 33, low: 36, info: 90 };
   const lines = [];
@@ -26,13 +32,66 @@ function formatText(findings, { filesScanned }, { color = false } = {}) {
   lines.push(
     `${findings.length} finding${findings.length === 1 ? '' : 's'}` +
       (breakdown ? ` (${breakdown})` : '') +
-      ` in ${filesScanned} file${filesScanned === 1 ? '' : 's'}`
+      ` in ${filesScanned} file${filesScanned === 1 ? '' : 's'}` +
+      (hidden ? ` (${hidden} more below --min-severity not shown${hiddenFailing ? ', including some at or above --fail-on' : ''})` : '')
   );
   return lines.join('\n');
 }
 
-function formatJson(findings, { filesScanned, skipped }) {
-  return JSON.stringify({ filesScanned, skipped, findings }, null, 2);
+function formatJson(findings, { filesScanned, skipped, errors = [] }, { hidden = 0 } = {}) {
+  return JSON.stringify({ filesScanned, skipped, errors, hidden, findings }, null, 2);
 }
 
-module.exports = { formatText, formatJson };
+// SARIF 2.1.0, as understood by GitHub code scanning and most CI viewers.
+function formatSarif(findings, { errors = [] }) {
+  const toUri = (file) => {
+    const rel = path.relative(process.cwd(), path.resolve(file)) || file;
+    return rel.split(path.sep).map(encodeURIComponent).join('/');
+  };
+  const ruleIndex = new Map(rules.map((r, i) => [r.id, i]));
+  const sarif = {
+    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',
+    version: '2.1.0',
+    runs: [
+      {
+        tool: {
+          driver: {
+            name: 'bughunter',
+            version,
+            rules: rules.map((r) => ({
+              id: r.id,
+              shortDescription: { text: r.description },
+              defaultConfiguration: { level: SARIF_LEVEL[r.severity] },
+            })),
+          },
+        },
+        invocations: [
+          {
+            executionSuccessful: errors.length === 0,
+            toolExecutionNotifications: errors.map((e) => ({
+              level: 'error',
+              message: { text: `${e.file}: ${e.message}` },
+            })),
+          },
+        ],
+        results: findings.map((f) => ({
+          ruleId: f.rule,
+          ruleIndex: ruleIndex.get(f.rule),
+          level: SARIF_LEVEL[f.severity],
+          message: { text: f.message },
+          locations: [
+            {
+              physicalLocation: {
+                artifactLocation: { uri: toUri(f.file) },
+                region: { startLine: f.line, startColumn: f.column },
+              },
+            },
+          ],
+        })),
+      },
+    ],
+  };
+  return JSON.stringify(sarif, null, 2);
+}
+
+module.exports = { formatText, formatJson, formatSarif };

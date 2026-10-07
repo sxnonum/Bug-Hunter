@@ -4,6 +4,9 @@
   "description": "Zero-dependency static analyzer that hunts for common bugs and risky patterns in JavaScript/TypeScript",
   "bin": { "bughunter": "bin/bughunter.js" },
   "main": "src/analyze.js",
+  "files": ["bin", "src", "README.md", "LICENSE"],
+  "keywords": ["static-analysis", "linter", "bugs", "security", "javascript", "typescript", "sarif"],
+  "repository": { "type": "git", "url": "git+https://github.com/sxnonum/Bug-Hunter.git" },
   "scripts": {
     "test": "node --test test/*.test.js",
     "scan": "node bin/bughunter.js src bin"
