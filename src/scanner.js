@@ -9,7 +9,21 @@ const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage
 const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_LINE_CHARS = 5000;
 const MINIFIED_NAME = /\.min\.[cm]?js$/i;
-const LONG_LINE = new RegExp(`[^\\r\\n]{${MAX_LINE_CHARS + 1}}`);
+const LINE_BREAK = /[\r\n]/g;
+
+// True if any line (broken at \r, \n or \r\n) is longer than `max` characters. One pass over
+// the text: an unanchored `[^\r\n]{5001}` regex retries at every offset and is quadratic.
+function hasLongLine(text, max = MAX_LINE_CHARS) {
+  let start = 0;
+  for (;;) {
+    LINE_BREAK.lastIndex = start;
+    const m = LINE_BREAK.exec(text);
+    const end = m ? m.index : text.length;
+    if (end - start > max) return true;
+    if (!m) return false;
+    start = end + 1;
+  }
+}
 
 const isScannable = (name) => EXTENSIONS.has(path.extname(name).toLowerCase());
 
@@ -42,18 +56,28 @@ function scanPaths(targets, { disabledRules = [], includeMinified = false, exclu
   const errors = [];
   const seenFiles = new Set(); // real paths, so overlapping arguments and symlinks count once
   const seenDirs = new Set(); // real paths, which also breaks symlink loops
+  const minifiedSkips = new Map(); // real path -> skipped entry, so a later explicit argument can still scan it
+  const deferred = []; // symlinks found while walking; followed only after every real file was seen
   let filesScanned = 0;
 
   const fail = (file, err) => errors.push({ file, message: typeof err === 'string' ? err : describe(err) });
   const isExcluded = (rel, name) => excludes.some((e) => e.regex.test(e.anchored ? rel : name));
 
-  function scanFile(file) {
+  // `explicit` = named on the command line: never skipped as minified, only for size or content.
+  function scanFile(file, relFile, explicit) {
     try {
       const real = fs.realpathSync(file);
       if (seenFiles.has(real)) return;
+      const earlier = minifiedSkips.get(real);
+      if (earlier) {
+        if (!explicit) return;
+        minifiedSkips.delete(real);
+        skipped.splice(skipped.indexOf(earlier), 1);
+      }
       seenFiles.add(real);
-      if (!includeMinified && MINIFIED_NAME.test(file)) {
-        skipped.push({ file, reason: 'minified' });
+      const checkMinified = !includeMinified && !explicit;
+      if (checkMinified && MINIFIED_NAME.test(file)) {
+        skipMinified(file, real);
         return;
       }
       if (fs.statSync(real).size > MAX_FILE_BYTES) {
@@ -66,17 +90,26 @@ function scanPaths(targets, { disabledRules = [], includeMinified = false, exclu
         return;
       }
       const text = buf.toString('utf8');
-      if (!includeMinified && LONG_LINE.test(text)) {
-        skipped.push({ file, reason: 'minified' });
+      if (checkMinified && hasLongLine(text)) {
+        skipMinified(file, real);
         return;
       }
-      for (const f of analyzeSource(text, { file, disabledRules })) findings.push(f);
+      for (const f of analyzeSource(text, { file, relFile, disabledRules })) findings.push(f);
       filesScanned++;
     } catch (err) {
       fail(file, err);
     }
   }
 
+  function skipMinified(file, real) {
+    const entry = { file, reason: 'minified' };
+    skipped.push(entry);
+    minifiedSkips.set(real, entry);
+    seenFiles.delete(real);
+  }
+
+  // Symlinks are not followed here but queued (see `deferred`), so a real file always wins over
+  // an alias of it, whatever order the directories come in.
   function walkDir(dir, rel) {
     let entries;
     try {
@@ -88,33 +121,40 @@ function scanPaths(targets, { disabledRules = [], includeMinified = false, exclu
       fail(dir, err);
       return;
     }
-    // Real files and directories first, so they win over symlinks to them when de-duplicating.
-    entries.sort((a, b) => a.isSymbolicLink() - b.isSymbolicLink() || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (IGNORED_DIRS.has(entry.name) || isExcluded(entryRel, entry.name)) continue;
-      let kind = entry.isDirectory() ? 'dir' : entry.isFile() ? 'file' : 'other';
       if (entry.isSymbolicLink()) {
-        try {
-          const st = fs.statSync(full);
-          kind = st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other';
-        } catch (err) {
-          const broken = err.code === 'ENOENT' || err.code === 'ELOOP';
-          // A broken link with some other extension (a README, a lockfile) cannot hide source code.
-          if (!broken) fail(full, err);
-          else if (isScannable(entry.name) || !path.extname(entry.name)) {
-            fail(full, err.code === 'ELOOP' ? 'symlink loop' : 'dangling symlink');
-          }
-          continue;
-        }
+        deferred.push({ full, entryRel, name: entry.name });
+        continue;
       }
-      if (kind === 'dir') walkDir(full, entryRel);
-      else if (isScannable(entry.name)) {
-        if (kind === 'file') scanFile(full);
-        else skipped.push({ file: full, reason: 'not-a-regular-file' });
-      }
+      visit(full, entryRel, entry.name, entry.isDirectory() ? 'dir' : entry.isFile() ? 'file' : 'other');
     }
+  }
+
+  function visit(full, entryRel, name, kind) {
+    if (kind === 'dir') walkDir(full, entryRel);
+    else if (isScannable(name)) {
+      if (kind === 'file') scanFile(full, entryRel, false);
+      else skipped.push({ file: full, reason: 'not-a-regular-file' });
+    }
+  }
+
+  function followSymlink({ full, entryRel, name }) {
+    let kind;
+    try {
+      const st = fs.statSync(full);
+      kind = st.isDirectory() ? 'dir' : st.isFile() ? 'file' : 'other';
+    } catch (err) {
+      const broken = err.code === 'ENOENT' || err.code === 'ELOOP';
+      // A broken link whose name is not a source file (.env, LICENSE, a README) cannot hide source code.
+      if (!broken) fail(full, err);
+      else if (isScannable(name)) fail(full, err.code === 'ELOOP' ? 'symlink loop' : 'dangling symlink');
+      return;
+    }
+    visit(full, entryRel, name, kind);
   }
 
   for (const target of targets) {
@@ -127,10 +167,12 @@ function scanPaths(targets, { disabledRules = [], includeMinified = false, exclu
       continue;
     }
     if (stat.isDirectory()) walkDir(target, '');
-    else if (stat.isFile()) scanFile(target);
+    else if (stat.isFile()) scanFile(target, path.basename(target), true);
     else skipped.push({ file: target, reason: 'not-a-regular-file' });
   }
+  // Second pass: follow the symlinks found above (and any found through them, in turn).
+  for (let i = 0; i < deferred.length; i++) followSymlink(deferred[i]);
   return { findings, filesScanned, skipped, errors };
 }
 
-module.exports = { scanPaths };
+module.exports = { scanPaths, hasLongLine };

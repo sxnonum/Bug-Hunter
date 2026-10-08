@@ -8,7 +8,7 @@ const SARIF_LEVEL = { high: 'error', medium: 'warning', low: 'note', info: 'note
 
 // `hidden` = findings removed by --min-severity; `hiddenFailing` says whether any of them
 // is at or above --fail-on (and so still decides the exit code).
-function formatText(findings, { filesScanned }, { color = false, hidden = 0, hiddenFailing = false } = {}) {
+function formatText(findings, { filesScanned, skipped = [] }, { color = false, hidden = 0, hiddenFailing = false } = {}) {
   const paint = (code, s) => (color ? `\x1b[${code}m${s}\x1b[0m` : s);
   const sevColor = { high: 31, medium: 33, low: 36, info: 90 };
   const lines = [];
@@ -33,6 +33,7 @@ function formatText(findings, { filesScanned }, { color = false, hidden = 0, hid
     `${findings.length} finding${findings.length === 1 ? '' : 's'}` +
       (breakdown ? ` (${breakdown})` : '') +
       ` in ${filesScanned} file${filesScanned === 1 ? '' : 's'}` +
+      (skipped.length ? `, ${skipped.length} skipped` : '') +
       (hidden ? ` (${hidden} more below --min-severity not shown${hiddenFailing ? ', including some at or above --fail-on' : ''})` : '')
   );
   return lines.join('\n');

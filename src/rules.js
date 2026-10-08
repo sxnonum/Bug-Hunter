@@ -1,10 +1,11 @@
 'use strict';
 
-const { isSecretName } = require('./names');
+const { isSecretName, nameWords } = require('./names');
 
 // Each rule has { id, severity, description, check(ctx) } where check returns
 // [{ line, column, message }] (1-based). `ctx` carries several views of the file:
-//   file                 path (used to skip .d.ts declaration files)
+//   file                 path as given (used to skip .d.ts declaration files)
+//   relFile              path relative to the scan root (used to recognise test files)
 //   raw / rawLines       original text
 //   str / strLines       comments blanked, string contents kept
 //   code / codeLines     comments, strings and regex bodies blanked
@@ -59,6 +60,8 @@ function skipSpaceBack(text, i) {
 }
 
 const isDeclarationFile = (file) => /\.d\.[cm]?ts$/i.test(file);
+// TypeScript-only files cannot hold JSX; `<T>expr` there is a cast.
+const allowsJsx = (file) => !/\.[cm]?ts$/i.test(file);
 
 // True when the source between a and b holds a comment (raw differs from the comment-blanked view).
 function hasComment(raw, str, a, b) {
@@ -68,43 +71,79 @@ function hasComment(raw, str, a, b) {
   return false;
 }
 
-// A line that holds only a comment (blank in the code view, not blank in the original).
-function isCommentLine(codeLines, rawLines, idx) {
-  return idx >= 0 && codeLines[idx].trim() === '' && rawLines[idx].trim() !== '';
+// A line that holds only a comment. Comments are blanked in the string-preserving view, but string,
+// template and JSX text are not, so a text line there is never mistaken for a comment.
+function isCommentLine(strLines, rawLines, idx) {
+  return idx >= 0 && strLines[idx].trim() === '' && rawLines[idx].trim() !== '';
 }
 
 const SECRET_PATTERNS = [
   { kind: 'AWS access key ID', re: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
   { kind: 'GitHub token', re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b/g },
-  { kind: 'Slack token', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/g },
+  // The digit-dash structure (xoxb-123456789012-...) keeps `xoxb-your-bot-token-here` out.
+  { kind: 'Slack token', re: /\bxox[abprs]-\d+-[A-Za-z0-9-]{8,}/g },
 ];
+// Documented dummy credentials: AWS's published `...EXAMPLE` key, `ghp_xxxx...`, `xoxb-your-token`.
+const TOKEN_PLACEHOLDER = /example|your|[x*]{8,}/i;
 const PRIVATE_KEY_HEADER = /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----/g;
-// `pem.startsWith('-----BEGIN PRIVATE KEY-----')` and the like only look for the header.
-const HEADER_CHECK_BEFORE =
-  /(?:\b(?:startsWith|endsWith|includes|indexOf|match|test|replace|search|split)\s*\(\s*|[=!]==?\s*|\bcase\s+)['"`]$/;
-const PLACEHOLDER_BODY = /^(?:\\+[rn]|\s)*(?:x{3,}|\*{3,}|\.{3}|<)/i;
 // scheme://user:password@host
 const URL_CREDENTIALS = /:\/\/([^\s/:@'"`$<>{}()\\]*):([^\s/@'"`$<>{}()\\]{4,})@/g;
-const PLACEHOLDER_PASSWORD = /^(?:pass(?:word)?|user(?:name)?|secret|root|admin|x+|\*+)$/i;
+const PLACEHOLDER_PASSWORD =
+  /^(?:(?:my|your|the)?(?:pass(?:w[o0]rd)?|pwd|secret|token|key)\d*|user(?:name)?|root|admin|x+|\*+)$/i;
 
-// Fixture credentials in test files are noise; the format-based patterns above still apply there.
-const TEST_FILE = /(?:^|[\\/])(?:tests?|__tests__|__mocks__|fixtures?|spec)[\\/]|\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+// Test code carries fixture credentials, so the name-based check skips it (the format-based checks
+// above still apply). It is judged by the path relative to the scan root, never by directories above
+// it: a project checked out under ~/test/ is not a test file.
+const TEST_FILE =
+  /(?:^|[\\/])(?:tests?|__tests__|__mocks__|__fixtures__|fixtures?|mocks?|spec|e2e|cypress)[\\/]|\.(?:test|spec|cy|e2e|stories)\.[cm]?[jt]sx?$/i;
 
-const SECRET_KEYWORDS = /pass|secret|token|key|credential|nonce|salt|csrf|otp|session/i;
-// name [: Type] (=|:) [process.env.X ||] 'value'; `name` may be quoted (JSON-style keys).
+const SECRET_KEYWORDS = /pass|secret|token|key|credential|nonce|salt|csrf|otp|session|pw/i;
+// name [: Type] (=|:) [process.env.X ||] 'value'; `name` may be quoted (JSON-style keys, obj['name']).
+// Groups: 1 name, 2/3 quoted name, 4 env fallback prefix, 5 quote, 6 value.
 const SECRET_ASSIGNMENT =
-  /(?<![\w$])(?:([A-Za-z_$][\w$]*)|(['"])([\w$-]+)\2)[?!]?(?:\s*:\s*[A-Za-z_$][\w$.<>[\]| ]{0,60}?)?\s*[:=](?!=)\s*(?:(?:process\.env(?:\.[\w$]+|\[[^\]\n]*\])|import\.meta\.env\.[\w$]+)\s*(?:\|\||\?\?)\s*)?(['"`])([^'"`\n]{8,})\4/g;
+  /(?<![\w$])(?:([A-Za-z_$][\w$]*)|(['"])([\w$-]+)\2(?:\s*\])?)[?!]?(?:\s*:\s*[A-Za-z_$][\w$.<>[\]| ]{0,60}?)?\s*[:=](?!=)\s*((?:process\.env(?:\.[\w$]+|\[[^\]\n]*\])|import\.meta\.env\.[\w$]+)\s*(?:\|\||\?\?)\s*)?(['"`])([^'"`\n]{6,})\5/g;
 const PLACEHOLDER_VALUE =
   /^(?:x+|\*+|\.+|-+|<.*>|\{\{.*\}\}|\$\{.*\}|%\w+%|(?:your|my)[_\- ].*|example.*|change[_-]?me|placeholder.*|dummy.*|redacted|none|null|undefined|pass(?:word)?|secret|token|api[_-]?key)$/i;
+// Names that are exactly a password or secret may hold shorter values (`password = 'hunter2'`).
+const EXACT_PASSWORD_NAMES = new Set(['password', 'passwd', 'pwd', 'pass', 'secret']);
+const PASSWORD_LAST_WORDS = new Set(['password', 'passwd', 'pwd', 'pass', 'passphrase', 'secret']);
+// One part of a dotted, snake_case or kebab-case identifier: a lowercase word (with a short
+// version digit), a Capitalized/UPPER word or a one- or two-digit number (app.session.v2).
+const WORDLIKE = /^(?:[a-z]+\d?\d?|[A-Z][A-Za-z]*|\d{1,2})$/;
+const CASE_TOKEN = /[A-Z]?[a-z]+|[A-Z]+(?![a-z])/g;
+const SENTENCE_WORDS = /^(?:the|is|are|a|an|and|or|not|to|for|of|you|your|enter|please|must|be|invalid|wrong|required|confirm|forgot|new|old|current|show|hide|min|max|at|least)$/i;
 
-// Values that are labels, identifiers, paths or URLs rather than a credential.
-function looksLikeSecretValue(value) {
-  if (/\s|\$\{|\[[^\]]*-[^\]]*\]/.test(value) || PLACEHOLDER_VALUE.test(value)) return false; // prose, templates, regex classes
+// camelCase / PascalCase words (`getAPIKey`, `InterpolationInJSX`) are made of mostly 3+ letter
+// pieces; a random mix of upper and lower case letters is made of short ones.
+function isCamelWord(word) {
+  const tokens = word.match(CASE_TOKEN) || [];
+  return tokens.join('') === word && tokens.filter((t) => t.length >= 3).length * 2 >= tokens.length;
+}
+
+// `keyboard cat`, `correct horse`: a short passphrase, not a label or a sentence.
+function passphraseLike(value) {
+  const words = value.split(/\s+/);
+  if (words.length > 3 || /[^A-Za-z0-9' ]/.test(value) || /\b(?:pass\w*|secret|token|key|credential\w*)\b/i.test(value)) return false;
+  if (/^[A-Z][a-z]+ [a-z]/.test(value)) return false; // Sentence case
+  return !words.some((w) => SENTENCE_WORDS.test(w));
+}
+
+// Positive test: does the value have the shape of a credential? Routes, identifiers, enum labels,
+// validation rules, translated words and plain dictionary-like words are labels, not secrets.
+// `fallback`: the value follows `process.env.X ||`, where a plain lowercase word is still a leak.
+// `passwordish`: the name ends in password/secret, which may hold a short passphrase.
+function looksLikeSecretValue(value, { fallback = false, passwordish = false } = {}) {
+  if (/\$\{|\[[^\]]*-[^\]]*\]/.test(value) || PLACEHOLDER_VALUE.test(value)) return false; // templates, regex classes
+  if (/[^\x20-\x7e]|[|\\]|^(?:\.{1,2}|~)?\//.test(value)) return false; // non-ASCII words, `a|b` rules, paths, routes
+  if (/\s/.test(value)) return passwordish && passphraseLike(value);
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false; // URLs are covered by the credentials-in-URL check
-  if (/\d/.test(value)) return true;
-  // No digits: enum labels (WHITESPACE), snake/kebab/dotted names, camelCase and Capitalized words.
-  if (/^[A-Za-z_$.:/?-]+$/.test(value) && /[A-Z_$.:/?-]/.test(value)) return false;
-  return true;
+  const parts = value.split(/[._:/?-]+/).filter(Boolean);
+  if (parts.length > 1 && parts.every((p) => WORDLIKE.test(p))) return false; // app.session.v2, SOME_ENUM, a-b-c
+  const word = parts.join('');
+  if (!word) return false;
+  if (/[^A-Za-z]/.test(word)) return true; // a digit or symbol among the letters
+  if (/[a-z]/.test(word) && /[A-Z]/.test(word) && !isCamelWord(word)) return true; // random case
+  return fallback && /^[a-z]+$/.test(word);
 }
 
 // Skip a candidate when the text before it shows it is the `?` branch of a ternary, a type or a declaration.
@@ -113,44 +152,73 @@ function isLabelContext(before) {
   return t.endsWith('?') || /\b(?:type|interface|declare\s+(?:const|let|var))\s+$/.test(before.slice(-24));
 }
 
-function secretFindings({ str, strLines, codeLines, posOf, file }) {
+// True when a base64 body (>= 40 chars) follows the PEM header at `from`, in the same string or
+// comment. A bare header constant, `startsWith('-----BEGIN ...')` or a `${body}` template is no leak.
+function hasKeyBody(raw, from) {
+  const lines = raw.slice(from, from + 6000).replace(/\\+[rn]/g, '\n').split(/\r\n?|\n/);
+  if (/['"`]/.test(lines[0])) return false; // the string ends right after the header
+  let body = 0;
+  for (const line of lines) {
+    const t = line.replace(/^\s*(?:\/\/+|\*+|#+)?\s*['"`]?/, '').replace(/[\s'"`+,;)\\]+$/, '');
+    if (t === '' || (body === 0 && /^[A-Za-z][\w-]*:/.test(t))) continue; // blank, or Proc-Type/DEK-Info
+    if (!/^[A-Za-z0-9+/=]+$/.test(t) || /^x+$/i.test(t)) break; // END line, `${b64}`, XXXX placeholder, prose
+    body += t.length;
+    if (body >= 40) return true;
+  }
+  return false;
+}
+
+function secretFindings({ raw, str, strLines, codeLines, posOf, file, relFile }) {
   const out = [];
+  // Token-shaped secrets are looked for in the raw text: a live credential committed in a comment is
+  // still leaked. Placeholders from documentation are skipped.
   for (const { kind, re } of SECRET_PATTERNS) {
-    out.push(...matchText(str, posOf, re, `Possible hardcoded secret (${kind})`));
+    out.push(...matchText(raw, posOf, re, (m) => (TOKEN_PLACEHOLDER.test(m[0]) ? null : `Possible hardcoded secret (${kind})`)));
   }
 
   out.push(
-    ...matchText(str, posOf, PRIVATE_KEY_HEADER, (m) => {
-      if (HEADER_CHECK_BEFORE.test(str.slice(Math.max(0, m.index - 40), m.index))) return null;
-      if (PLACEHOLDER_BODY.test(str.slice(m.index + m[0].length, m.index + m[0].length + 24))) return null;
-      return 'Possible hardcoded secret (private key)';
-    })
+    ...matchText(raw, posOf, PRIVATE_KEY_HEADER, (m) =>
+      hasKeyBody(raw, m.index + m[0].length) ? 'Possible hardcoded secret (private key)' : null
+    )
   );
 
-  if (str.includes('://')) {
+  if (raw.includes('://')) {
     out.push(
-      ...matchText(str, posOf, URL_CREDENTIALS, (m) => {
+      ...matchText(raw, posOf, URL_CREDENTIALS, (m) => {
         if (PLACEHOLDER_VALUE.test(m[2]) || PLACEHOLDER_PASSWORD.test(m[2])) return null;
-        // The URL must open a string (`'postgres://u:p@host'`), not sit inside prose.
+        // The URL must open a string (`'postgres://u:p@host'`) or start a word in a comment, not sit inside prose.
         let start = m.index;
-        while (start > 0 && m.index - start < 20 && /[a-z0-9+.-]/i.test(str[start - 1])) start--;
-        return start < m.index && /['"`]/.test(str[start - 1] || '')
-          ? 'Possible hardcoded secret (credentials embedded in a URL)'
-          : null;
+        while (start > 0 && m.index - start < 20 && /[a-z0-9+.-]/i.test(raw[start - 1])) start--;
+        if (start === m.index) return null;
+        const comment = str[m.index] === ' ' && raw[m.index] !== ' ';
+        const before = raw[start - 1] || '';
+        const opens = comment ? start === 0 || /[\s('"`<]/.test(before) : /['"`]/.test(before);
+        return opens ? 'Possible hardcoded secret (credentials embedded in a URL)' : null;
       })
     );
   }
 
-  if (isDeclarationFile(file) || TEST_FILE.test(file)) return out; // `declare const token: "abc"` states a type
+  if (isDeclarationFile(file) || TEST_FILE.test(relFile)) return out; // `declare const token: "abc"` states a type
   const assignment = new RegExp(SECRET_ASSIGNMENT.source, 'g');
-  strLines.forEach((text, idx) => {
-    if (!SECRET_KEYWORDS.test(text)) return;
+  strLines.forEach((line, idx) => {
+    if (!SECRET_KEYWORDS.test(line)) return;
+    let text = line;
+    // Prettier puts a long value on the next line: `const password =\n  'value'`.
+    const next = strLines[idx + 1];
+    if (next !== undefined && /(?:[:=]|\|\||\?\?)\s*$/.test(text) && /^\s*(?:['"`]|process\.env|import\.meta)/.test(next)) {
+      text += ' ' + next.trim();
+    }
     assignment.lastIndex = 0;
     let m;
     while ((m = assignment.exec(text)) !== null) {
       if (codeLines[idx][m.index] !== text[m.index]) continue; // match starts inside a string
-      if (!isSecretName(m[1] || m[3]) || isLabelContext(text.slice(0, m.index))) continue;
-      if (!looksLikeSecretValue(m[5])) continue;
+      const name = m[1] || m[3];
+      if (!isSecretName(name) || isLabelContext(text.slice(0, m.index))) continue;
+      const words = nameWords(name);
+      const exact = words.length === 1 && EXACT_PASSWORD_NAMES.has(words[0]);
+      if (m[6].length < (exact ? 6 : 8)) continue;
+      const passwordish = PASSWORD_LAST_WORDS.has(words[words.length - 1]);
+      if (!looksLikeSecretValue(m[6], { fallback: Boolean(m[4]), passwordish })) continue;
       out.push({
         line: idx + 1,
         column: m.index + 1,
@@ -207,21 +275,25 @@ function evalFindings({ code, posOf }) {
 
 // ---- command-injection ---------------------------------------------------------------------
 
+// Only the shell-spawning calls: exec, execSync (and the promisified spellings), not execFile*/execute*/execPath.
+const EXEC_NAME = String.raw`exec(?:Sync|Async|P|Promise)?\s*\(`;
 const EXEC_CALLEE = new RegExp(
   [
-    /(?<![.\w$])exec(?:Sync|Async|P|Promise)?\s*\(/.source,
-    /(?<![\w$])(?:[cC]hild_?[pP]rocess|cp|proc|shell|sh)\s*\.\s*exec\w*\s*\(/.source,
-    /require\s*\(\s*['"](?:node:)?child_process['"]\s*\)\s*\.\s*exec\w*\s*\(/.source,
+    String.raw`(?<![.\w$])` + EXEC_NAME,
+    String.raw`(?<![\w$])(?:[cC]hild_?[pP]rocess|cp|proc|shell|sh)\s*\.\s*` + EXEC_NAME,
+    String.raw`require\s*\(\s*['"](?:node:)?child_process['"]\s*\)\s*\.\s*` + EXEC_NAME,
   ].join('|'),
   'g'
 );
 
 // Source of the first argument of the call whose '(' is at `open`, plus whether it has a top-level '+'.
-function firstArgument(code, open) {
+// There is no length cap (a long inline shell script is still a dynamic command); `budget.left` bounds
+// the total work so many unclosed calls cannot make the rule quadratic.
+function firstArgument(code, open, budget) {
   let depth = 0;
   let plus = false;
-  const end = Math.min(code.length, open + 2000);
-  for (let i = open; i < end; i++) {
+  for (let i = open; i < code.length; i++) {
+    if (--budget.left < 0) return null;
     const ch = code[i];
     if (ch === '(' || ch === '[' || ch === '{') depth++;
     else if (ch === ')' || ch === ']' || ch === '}') {
@@ -248,8 +320,9 @@ function isDynamicCommand({ text, plus }) {
 const JUMP = /^(\s*)(return|throw|break|continue)(?![\w$])/;
 const OPERATOR_END = /(?:(?<![+-])[+-]|[*/%&|^,?:=.<~]|=>|\b(?:in|of|instanceof|typeof|new|void|await|delete))$/;
 const CONTINUATION_START = /^(?:[.?:+\-*/%&|,;{(\[`]|=>)/;
+// `</h1>` and `/>` can only close JSX; they are never statements.
 const NOT_DEAD_START =
-  /^(?:[}\])]|case\b|default\b|else\b|catch\b|finally\b|(?:async\s+)?function\b|interface\b|declare\b|type\s+[\w$]+\s*[=<])/;
+  /^(?:[}\])]|<\/|\/>|case\b|default\b|else\b|catch\b|finally\b|(?:async\s+)?function\b|interface\b|declare\b|type\s+[\w$]+\s*[=<])/;
 // A braceless `if (x)` / `else` / `for (...)` / `do` line: the jump below it is its body.
 const BRACELESS_HEADER = /^(?:\}\s*)?(?:(?:else\s+if|if|for|while|with)\b.*\)|else|do)\s*$/;
 
@@ -301,6 +374,50 @@ function statementEnd(codeLines, start, col) {
     return { line: i, semi: false };
   }
   return null;
+}
+
+// Where the JSX element that `return <tag ...>` starts at (start, col) ends: { line, semi }, or null.
+// Children such as `{title}` or text lines would otherwise end the statement early and leave the
+// closing tag, aligned with `return`, looking like dead code.
+function jsxReturnEnd(codeLines, start, col) {
+  let depth = 0; // open elements
+  let inTag = false; // between '<' and its '>'
+  let closing = false; // inside `</tag`
+  let braces = 0; // inside {expression} (attributes or children)
+  const last = Math.min(codeLines.length, start + 400);
+  for (let i = start; i < last; i++) {
+    const text = codeLines[i];
+    for (let c = i === start ? col : 0; c < text.length; c++) {
+      const ch = text[c];
+      if (ch === '{') braces++;
+      else if (ch === '}') {
+        if (--braces < 0) return null;
+      } else if (braces > 0) continue;
+      else if (!inTag) {
+        if (ch !== '<') continue;
+        inTag = true;
+        closing = text[c + 1] === '/';
+      } else if (ch === '/' && text[c + 1] === '>') {
+        inTag = false;
+        c++;
+        if (closing) return null;
+        if (depth === 0) return jsxEndLine(text, c + 1, i);
+      } else if (ch === '>') {
+        inTag = false;
+        if (closing) depth--;
+        else depth++;
+        if (depth <= 0) return jsxEndLine(text, c + 1, i);
+      }
+    }
+  }
+  return null;
+}
+
+// After the closing '>' of the outermost element: only `;` (or nothing) may follow.
+function jsxEndLine(text, from, line) {
+  const rest = text.slice(from).trim();
+  if (rest === ';') return { line, semi: true };
+  return rest === '' ? { line, semi: false } : null;
 }
 
 // ---- insecure-random -----------------------------------------------------------------------
@@ -428,7 +545,65 @@ function returnTarget(code, boundary, p) {
   return name && isSecretName(name) ? { name, offset: p } : null;
 }
 
-// ---- tls / dom ----------------------------------------------------------------------------
+// ---- tls -----------------------------------------------------------------------------------
+
+const TLS_MESSAGE = 'TLS certificate verification is disabled';
+// A `NODE_TLS_REJECT_UNAUTHORIZED=0` inside a string counts only when the string is a shell/env
+// assignment: it starts with it or follows `;` `&&` `|` (optionally after `export`/`env`/other VAR=x).
+const SHELL_ASSIGNMENT_PREFIX = /(?:^|[;&|(]\s*)(?:(?:export|env|set|cross-env)\s+|\w+=\S*\s+)*$/;
+// Strings handed to these are messages for a human, not commands.
+const MESSAGE_CALLEE = /(?:\b(?:console|logger|log|process\.std(?:err|out))\s*\.\s*\w+|\.(?:log|warn|warning|error|info|debug|trace|write)|\b(?:Error|TypeError|RangeError|warn|warning|emitWarning|alert|print))\s*$/;
+
+// `interface Opts { rejectUnauthorized: false }` and `type T = { rejectUnauthorized: false } | {...}` in
+// TypeScript describe a type; they do not turn verification off.
+function inTypeDeclaration(code, index) {
+  let depth = 0;
+  for (let i = index; i >= 0 && i > index - 4000; i--) {
+    const ch = code[i];
+    if (ch === '}') depth++;
+    else if (ch === '{' && depth-- === 0) {
+      const header = code.slice(Math.max(0, i - 200), i);
+      return (
+        /\b(?:interface|enum|class)\s+[\w$]+[^{};=]*$/.test(header) ||
+        /\btype\s+[\w$]+[^={};]*=\s*(?:[^{};]*[|&]\s*)?$/.test(header) ||
+        /[|&]\s*$/.test(header)
+      );
+    }
+  }
+  return false;
+}
+
+function tlsFindings({ file, str, code, posOf }) {
+  const typed = /\.[cm]?tsx?$/i.test(file);
+  // The key and assignment forms are looked for in code, so text in messages and docs is ignored.
+  // A quoted key keeps its delimiter in the code view (the text between is blanked).
+  const real = (index, quote) => (quote ? code[index] === quote : code[index] === str[index]);
+  return [
+    ...matchText(str, posOf, TLS_KEY, (m) => {
+      if (!real(m.index, m[1])) return null;
+      // `{ rejectUnauthorized: false }`, not `cond ? rejectUnauthorized : false`.
+      const prev = str[skipSpaceBack(str, m.index - 1)];
+      if (prev !== undefined && prev !== '{' && prev !== ',') return null;
+      return typed && inTypeDeclaration(code, m.index) ? null : TLS_MESSAGE;
+    }),
+    ...matchText(str, posOf, TLS_ASSIGN, (m) => (real(m.index) ? TLS_MESSAGE : null)),
+    ...matchText(str, posOf, TLS_ENV, (m) => {
+      const message = 'TLS certificate verification is disabled globally';
+      if (code[m.index] === str[m.index]) return message; // a property or variable, not text
+      // Inside a string: find where it opens (its delimiter is kept in the code view).
+      let open = m.index - 1;
+      while (open >= 0 && m.index - open < 2000 && !(code[open] === str[open] && '\'"`'.includes(str[open]))) open--;
+      if (open < 0 || m.index - open >= 2000) return null;
+      // `'NODE_TLS_REJECT_UNAUTHORIZED'` is a whole key: `env['NODE_TLS_...'] = 0`, `{ 'NODE_TLS_...': '0' }`.
+      if (open === m.index - 1 && /['"\]]/.test(m[0].slice('NODE_TLS_REJECT_UNAUTHORIZED'.length))) return message;
+      if (!SHELL_ASSIGNMENT_PREFIX.test(str.slice(open + 1, m.index))) return null;
+      // `console.warn('NODE_TLS_REJECT_UNAUTHORIZED=0 disables checks')` is advice, not a command.
+      return MESSAGE_CALLEE.test(str.slice(Math.max(0, open - 40), open).replace(/\(\s*$/, '').trimEnd()) ? null : message;
+    }),
+  ];
+}
+
+// ---- dom ----------------------------------------------------------------------------
 
 const FALSE_VALUE = String.raw`(?:false|0|!1)(?![\w$.])`;
 const TLS_KEY = new RegExp(String.raw`(['"]?)rejectUnauthorized\1\s*:\s*${FALSE_VALUE}`, 'g');
@@ -441,6 +616,67 @@ const TLS_ENV = /NODE_TLS_REJECT_UNAUTHORIZED['"\]]*\s*[:=](?!=)\s*['"`]?0(?![\w
 const HTML_ASSIGN = /\.(?:innerHTML|outerHTML)\s*\+?=(?!=)\s*/g;
 // A literal with no interpolation: `el.innerHTML = ''` cannot inject anything.
 const CONSTANT_STRING = /^(?:"[^"]*"|'[^']*'|`[^`$]*`)\s*(?:[;,)}\n]|$)/;
+
+// The nearest non-blank code line above (dir -1) or below (dir 1) line `idx`, or ''.
+function adjacentCode(lines, idx, dir) {
+  for (let j = idx + dir; j >= 0 && j < lines.length && Math.abs(j - idx) <= 5; j += dir) {
+    if (lines[j].trim() !== '') return lines[j];
+  }
+  return '';
+}
+
+// Index of the opening bracket matching the closing one at `close`, or -1 (scans at most 2000 chars).
+function matchOpenBack(text, close) {
+  let depth = 0;
+  for (let i = close; i >= 0 && i > close - 2000; i--) {
+    const ch = text[i];
+    if (ch === ')' || ch === ']' || ch === '}') depth++;
+    else if ((ch === '(' || ch === '[' || ch === '{') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+// True when `before` ends with `typeof <operand>`: an identifier path with calls, indexes or
+// parentheses (`typeof a.b(c)`, `typeof (x || y)`, `typeof require('x')`).
+function endsWithTypeofOperand(before) {
+  let i = before.length - 1;
+  for (let steps = 0; steps < 50; steps++) {
+    i = skipSpaceBack(before, i);
+    if (i < 0) return false;
+    const group = before[i] === ')' || before[i] === ']';
+    if (group) {
+      const open = matchOpenBack(before, i);
+      if (open < 0) return false;
+      i = open - 1;
+    } else if (isWordChar(before[i])) {
+      let j = i;
+      while (j >= 0 && isWordChar(before[j])) j--;
+      if (before.slice(j + 1, i + 1) === 'typeof') return true;
+      i = j;
+    } else return false;
+    // Member access (`a.b`, `a?.b`) continues the operand; so does the callee in front of a group.
+    const k = skipSpaceBack(before, i);
+    if (k < 0) return false;
+    if (before[k] === '.') i = before[k - 1] === '?' ? k - 2 : k - 1;
+    else if (isWordChar(before[k]) && !group) return /(?:^|[^\w$])typeof$/.test(before.slice(0, k + 1));
+    else if (!group || !(isWordChar(before[k]) || before[k] === ')' || before[k] === ']')) return false;
+  }
+  return false;
+}
+
+// 'string' | 'number' | 'boolean' when the text starts (atStart) or ends a literal of that type
+// directly after/before an operator-ish boundary; null otherwise.
+function literalKind(text, atEnd) {
+  const literal = String.raw`("[^"]*"|'[^']*'|\x60[^\x60$]*\x60|-?\d[\w.]*|true|false)`;
+  const re = atEnd
+    ? new RegExp(String.raw`(?:^|[(,;=&|?:!{}\[]|\breturn)\s*${literal}\s*$`)
+    : new RegExp(String.raw`^\s*${literal}\s*(?:[;,)\]}?:&|]|$)`);
+  const m = re.exec(text);
+  if (!m) return null;
+  const v = m[1];
+  if (v === 'true' || v === 'false') return 'boolean';
+  return /^["'\x60]/.test(v) ? 'string' : 'number';
+}
 
 const rules = [
   {
@@ -470,22 +706,23 @@ const rules = [
   {
     id: 'loose-equality',
     severity: 'low',
-    description: '== and != coerce types; prefer === and !==',
+    description:
+      '== and != coerce types; prefer === and !== (== null, == undefined, == void 0, typeof comparisons and same-type literal pairs are allowed)',
     check: ({ codeLines }) =>
-      // eqeqeq "smart": typeof comparisons, two literals and null/undefined checks are fine.
-      matchLines(codeLines, /(?<![=!<>])(==|!=)(?!=)/, (m, text) => {
-        const before = text.slice(Math.max(0, m.index - 60), m.index);
-        const after = text.slice(m.index + 2, m.index + 62);
+      // Like eqeqeq "smart", plus `== undefined`: typeof comparisons, two literals of one type and
+      // null/undefined checks are fine. An operand that wraps onto the next or previous line counts.
+      matchLines(codeLines, /(?<![=!<>])(==|!=)(?!=)/, (m, text, idx) => {
+        let lead = text.slice(0, m.index);
+        let rest = text.slice(m.index + 2);
+        if (lead.trim() === '') lead = adjacentCode(codeLines, idx, -1) + ' ' + lead;
+        if (rest.trim() === '') rest = adjacentCode(codeLines, idx, 1);
+        const before = lead.slice(-60);
+        const after = rest.slice(0, 60);
         if (/^\s*(?:null|undefined)(?![\w$])|^\s*void\s+0(?![\w$])/.test(after)) return null;
         if (/(?:(?<![\w$.])(?:null|undefined)|\bvoid\s+0)\s*$/.test(before)) return null;
-        if (/^\s*typeof(?![\w$])/.test(after) || /\btypeof(?:\s+|\s*\()[\w$.[\]' "]*\)?\s*$/.test(before)) return null;
-        const literal = String.raw`(?:"[^"]*"|'[^']*'|\x60[^\x60$]*\x60|-?\d[\w.]*|true|false)`;
-        if (
-          new RegExp(String.raw`(?:^|[(,;=&|?:!{}\[]|\breturn)\s*${literal}\s*$`).test(before) &&
-          new RegExp(String.raw`^\s*${literal}\s*(?:[;,)\]}?:&|]|$)`).test(after)
-        ) {
-          return null;
-        }
+        if (/^\s*typeof(?![\w$])/.test(after) || endsWithTypeofOperand(lead)) return null;
+        const left = literalKind(before, true);
+        if (left && left === literalKind(after, false)) return null;
         return `Use ${m[1]}= instead of ${m[1]} to avoid type coercion`;
       }),
   },
@@ -528,7 +765,7 @@ const rules = [
     id: 'empty-catch',
     severity: 'medium',
     description: 'Errors are caught and silently discarded',
-    check: ({ code, raw, str, rawLines, codeLines, posOf }) => {
+    check: ({ code, raw, str, rawLines, strLines, codeLines, posOf }) => {
       const out = [];
       // A comment inside the block, trailing after it or on the line above the statement means
       // the author meant to ignore the error.
@@ -540,7 +777,8 @@ const rules = [
         return commentAbove;
       };
 
-      const tryRe = /(?<!\.)\bcatch\s*(?:\(\s*[\w$]*\s*(?::[^)]{0,100})?\))?\s*\{\s*\}/g;
+      // Each optional piece owns its own whitespace, so no position can be matched in two ways.
+      const tryRe = /(?<!\.)\bcatch\s*(?:\(\s*(?:[\w$]+\s*)?(?::[^)]{0,100})?\)\s*)?\{\s*\}/g;
       let m;
       while ((m = tryRe.exec(code)) !== null) {
         // The statement is the `try`: step over the `}` in front of `catch` back to its `try {`.
@@ -555,22 +793,23 @@ const rules = [
           k = skipSpaceBack(code, k - 1);
           if (k >= 2 && code.slice(k - 2, k + 1) === 'try') stmtStart = k - 2;
         }
-        if (!explained(m.index, m.index + m[0].length, isCommentLine(codeLines, rawLines, posOf(stmtStart).line - 2))) {
+        if (!explained(m.index, m.index + m[0].length, isCommentLine(strLines, rawLines, posOf(stmtStart).line - 2))) {
           out.push({ ...posOf(m.index), message: 'Empty catch block swallows errors' });
         }
       }
 
+      // A return type annotation is words separated by single runs of spaces, so every position has one way to match.
       const handlerRe =
-        /\.catch\s*\(\s*(?:async\s+)?(?:function(?:\s+[\w$]+)?\s*\([^()]*\)|(?:\([^()]*\)(?:\s*:\s*[\w$<>[\].| ]+)?|[\w$]+)\s*=>)\s*\{\s*\}\s*\)/g;
+        /\.catch\s*\(\s*(?:async\s+)?(?:function(?:\s+[\w$]+)?\s*\([^()]*\)|(?:\([^()]*\)(?:\s*:\s*[\w$<>[\].|]+(?:\s+[\w$<>[\].|]+)*)?|[\w$]+)\s*=>)\s*\{\s*\}\s*\)/g;
       while ((m = handlerRe.exec(code)) !== null) {
         if (resultIsUsed(code, Math.max(0, m.index - 500), m.index)) continue;
         // Walk up a chained statement (`promise\n  .then(...)\n  .catch(...)`) looking for a comment.
         let first = posOf(m.index).line - 1;
-        let commentAbove = isCommentLine(codeLines, rawLines, first - 1);
+        let commentAbove = isCommentLine(strLines, rawLines, first - 1);
         while (first > 0 && codeLines[first].trimStart().startsWith('.')) {
           first--;
           while (first > 0 && codeLines[first].trim() === '') first--;
-          if (isCommentLine(codeLines, rawLines, first - 1)) commentAbove = true;
+          if (isCommentLine(strLines, rawLines, first - 1)) commentAbove = true;
         }
         if (!explained(m.index, m.index + m[0].length, commentAbove)) {
           out.push({ ...posOf(m.index), message: 'Empty .catch() handler swallows errors' });
@@ -603,10 +842,11 @@ const rules = [
     check: ({ str, code, posOf }) => {
       const out = [];
       const re = new RegExp(EXEC_CALLEE.source, 'g');
+      const budget = { left: 4 * code.length + 100000 };
       let m;
       while ((m = re.exec(str)) !== null) {
         if (code[m.index] !== str[m.index]) continue; // inside a string
-        const arg = firstArgument(code, m.index + m[0].length - 1);
+        const arg = firstArgument(code, m.index + m[0].length - 1, budget);
         if (arg && isDynamicCommand(arg)) {
           out.push({
             ...posOf(m.index),
@@ -643,7 +883,10 @@ const rules = [
         }
         const prev = prevLine(codeLines, i);
         if (prev >= 0 && indent(codeLines[prev]) < m[1].length && BRACELESS_HEADER.test(codeLines[prev].trim())) continue;
-        const end = statementEnd(codeLines, i, m[1].length);
+        const jsx = m[2] === 'return' && /^\s*<[A-Za-z_$>]/.test(rest) && allowsJsx(file);
+        const end =
+          (jsx && jsxReturnEnd(codeLines, i, m[0].length + rest.indexOf('<'))) ||
+          statementEnd(codeLines, i, m[1].length);
         if (!end) continue;
         const j = nextLine(end.line + 1);
         if (j >= codeLines.length || indent(codeLines[j]) !== m[1].length) continue;
@@ -662,7 +905,7 @@ const rules = [
     check: ({ codeLines }) =>
       matchLines(
         codeLines,
-        /\bparseInt\s*\(\s*(?:[^(),]|\([^()]*\))+\)/,
+        /\bparseInt\s*\(\s*(?:[^(),\s]|\([^()]*\))(?:[^(),]|\([^()]*\))*\)/,
         'parseInt without a radix; pass 10 (or use Number())'
       ),
   },
@@ -691,15 +934,7 @@ const rules = [
     id: 'tls-verification-disabled',
     severity: 'high',
     description: 'TLS certificate verification turned off',
-    check: ({ str, posOf }) => [
-      ...matchText(str, posOf, TLS_KEY, (m) => {
-        // `{ rejectUnauthorized: false }`, not `cond ? rejectUnauthorized : false`.
-        const prev = str[skipSpaceBack(str, m.index - 1)];
-        return prev === undefined || prev === '{' || prev === ',' ? 'TLS certificate verification is disabled' : null;
-      }),
-      ...matchText(str, posOf, TLS_ASSIGN, 'TLS certificate verification is disabled'),
-      ...matchText(str, posOf, TLS_ENV, 'TLS certificate verification is disabled globally'),
-    ],
+    check: tlsFindings,
   },
   {
     id: 'dom-xss',
@@ -748,20 +983,26 @@ function prevLine(lines, i) {
 
 // True when the `.catch(...)` ending a chain at `to` feeds a value: it is assigned, returned,
 // part of an argument list or array, or the branch of a ternary. `from` is some earlier point.
+// The statement start is kept per bracket: leaving a callback or object that sits inside an
+// expression restores the start of that expression, so `return a.then(x => {\n ... }).catch(..)`
+// still sees its `return`.
 function resultIsUsed(code, from, to) {
-  const stack = [];
+  const stack = []; // { ch, outer }: bracket kind and the statement start in force outside it
   let start = from;
   for (let i = from; i < to; i++) {
     const ch = code[i];
-    const top = stack[stack.length - 1];
-    if (ch === '(' || ch === '[') stack.push(ch);
+    const top = stack.length ? stack[stack.length - 1].ch : undefined;
+    if (ch === '(' || ch === '[') stack.push({ ch, outer: start });
     else if (ch === '{') {
-      stack.push(ch);
+      stack.push({ ch, outer: start, inExpression: top === '(' || top === '[' });
       start = i + 1;
-    } else if (ch === ')' || ch === ']') stack.pop();
-    else if (ch === '}') {
-      stack.pop();
-      if (!stack.length || stack[stack.length - 1] === '{') start = i + 1;
+    } else if (ch === ')' || ch === ']') {
+      const closed = stack.pop();
+      if (closed) start = closed.outer;
+    } else if (ch === '}') {
+      const closed = stack.pop();
+      if (closed && closed.inExpression) start = closed.outer; // callback or object argument
+      else start = i + 1; // end of a block
     } else if (ch === ';' && (!top || top === '{')) start = i + 1;
     else if (ch === '\n' && (!top || top === '{')) {
       const before = code[skipSpaceBack(code, i - 1)];
@@ -770,9 +1011,18 @@ function resultIsUsed(code, from, to) {
       if (!joined) start = i + 1;
     }
   }
-  const top = stack[stack.length - 1];
+  const top = stack.length ? stack[stack.length - 1].ch : undefined;
   if (top === '(' || top === '[') return true;
-  return /(?<![=!<>])=(?![=>])|\breturn\b|\byield\b|=>|[?:](?!\.)/.test(code.slice(start, to));
+  // Only the statement's own tokens count, not what sits inside its brackets (`a.then(x => y).catch(..)`).
+  let flat = '';
+  let depth = 0;
+  for (let i = start; i < to; i++) {
+    const ch = code[i];
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    else if (depth === 0) flat += ch;
+  }
+  return /(?<![=!<>])=(?![=>])|\breturn\b|\byield\b|=>|[?:](?!\.)/.test(flat);
 }
 
 module.exports = { rules };

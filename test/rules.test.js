@@ -64,7 +64,9 @@ test('hardcoded-secret detects known formats and assignments without echoing the
   assert.ok(has(`const t = "${gh}";`, 'hardcoded-secret'));
   assert.ok(has('const cfg = { password: "hunter2hunter2" };', 'hardcoded-secret'));
   assert.ok(has('const apiKey = "abcd1234efgh5678";', 'hardcoded-secret'));
-  assert.ok(has('const k = "-----BEGIN RSA ' + 'PRIVATE KEY-----";', 'hardcoded-secret'));
+  const body = 'MIIEowIBAAKCAQEA' + 'x7Qm4pLz'.repeat(8);
+  assert.ok(has('const k = "-----BEGIN RSA ' + 'PRIVATE KEY-----\\n' + body + '\\n-----END RSA PRIVATE KEY-----";', 'hardcoded-secret'));
+  assert.ok(!has('const k = "-----BEGIN RSA ' + 'PRIVATE KEY-----";', 'hardcoded-secret')); // a bare header leaks nothing
 });
 
 test('hardcoded-secret skips env lookups, placeholders and messages', () => {

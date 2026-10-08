@@ -60,14 +60,130 @@ test('hardcoded-secret flags typed declarations and env fallbacks', () => {
 
 test('hardcoded-secret detects more token and key formats', () => {
   const pat = 'github' + '_pat_' + '11ABCDEFG0' + 'a'.repeat(60);
+  const body = 'MIIEowIBAAKCAQEA' + 'x7Qm4pLz'.repeat(8);
   assert.ok(has(`const t = '${pat}';`));
-  assert.ok(has("const k = '-----BEGIN PGP PRIVATE KEY BLOCK-----';"));
-  assert.ok(has("const k = '-----BEGIN ENCRYPTED PRIVATE KEY-----';"));
-  assert.ok(has("const k = '-----BEGIN OPENSSH PRIVATE KEY-----';"));
+  for (const kind of ['PGP PRIVATE KEY BLOCK', 'ENCRYPTED PRIVATE KEY', 'OPENSSH PRIVATE KEY', 'PRIVATE KEY']) {
+    assert.ok(has(`const k = '-----BEGIN ${kind}-----\\n${body}\\n-----END ${kind}-----\\n';`), kind);
+  }
+  assert.ok(has('const k = `-----BEGIN RSA PRIVATE KEY-----\n' + body + '\n-----END RSA PRIVATE KEY-----`;'));
+  assert.ok(has("const k = '-----BEGIN RSA PRIVATE KEY-----\\n' +\n  '" + body + "\\n';"));
   assert.ok(has("const k = 'AS" + "IAABCDEFGHIJKLMNOP';"));
+  assert.ok(has("const t = 'xoxb-123456789012-1234567890123-" + "AbCdEfGhIjKlMnOpQrStUvWx';"));
   assert.ok(!has('const k = "-----BEGIN PUBLIC KEY-----";'));
   // Documentation example with a placeholder body.
-  assert.ok(!has('const help = `key="-----BEGIN PRIVATE KEY-----\\\\nXXXX\\\\nXXXX\\\\n-----END PRIVATE KEY-----"`;'));
+  assert.ok(!has('const help = `key="-----BEGIN PRIVATE KEY-----\\nXXXX\\nXXXX\\n-----END PRIVATE KEY-----"`;'));
+});
+
+test('hardcoded-secret needs key material after a PEM header', () => {
+  const body = 'MIIEowIBAAKCAQEA' + 'x7Qm4pLz'.repeat(8);
+  for (const src of [
+    "const HEADER = '-----BEGIN PRIVATE KEY-----';",
+    "const HEADERS = ['-----BEGIN PRIVATE KEY-----', '-----BEGIN RSA PRIVATE KEY-----'];",
+    'function toPem(b64) { return `-----BEGIN PRIVATE KEY-----\\n${b64}\\n-----END PRIVATE KEY-----\\n`; }',
+    "const pem = '-----BEGIN PRIVATE KEY-----\\n' + b64 + '\\n-----END PRIVATE KEY-----';",
+    "if (!pem.startsWith('-----BEGIN PRIVATE KEY-----')) throw new Error('bad');",
+    "const pem = '-----BEGIN PRIVATE KEY-----' + '\\n' + b64;",
+  ]) {
+    assert.ok(!has(src), src);
+  }
+  assert.ok(has("const pem = '-----BEGIN PRIVATE KEY-----\\nProc-Type: 4,ENCRYPTED\\nDEK-Info: AES-128-CBC,0123\\n\\n" + body + "';"));
+});
+
+test('hardcoded-secret skips documented placeholder tokens', () => {
+  assert.ok(!has("const example = 'AKIAIOSFODNN7EXAMPLE';"));
+  assert.ok(!has("console.log('usage: tool --token ghp_" + 'x'.repeat(36) + "');"));
+  assert.ok(!has("console.log('usage: tool --token ghp_" + '*'.repeat(36) + "');"));
+  assert.ok(!has("const help = 'SLACK_BOT_TOKEN=xoxb-your-bot-token-here';"));
+  assert.ok(!has("const help = 'SLACK_BOT_TOKEN=xoxb-1234-5678-" + "xxxxxxxxxxxx';"));
+  assert.ok(!has("const t = 'xoxb-not-a-real-token-but-long-enough';"));
+  assert.ok(has("const t = 'ghp_" + 'a'.repeat(36) + "';"));
+});
+
+test('hardcoded-secret finds format-based secrets in comments', () => {
+  const body = 'MIIEowIBAAKCAQEA' + 'x7Qm4pLz'.repeat(8);
+  assert.ok(has('// const key = "AKIAIOSFODNN7ABCDEFG";'));
+  assert.ok(has('/* old token: ghp_' + 'a'.repeat(36) + ' */'));
+  assert.ok(has('// xo' + 'xb-123456789012-abcdefghijklmnop'));
+  assert.ok(has('// postgres://admin:hunter2pw@db.internal/app'));
+  assert.ok(has('/*\n-----BEGIN RSA PRIVATE KEY-----\n' + body + '\n-----END RSA PRIVATE KEY-----\n*/'));
+  assert.ok(has('/**\n * -----BEGIN RSA PRIVATE KEY-----\n * ' + body + '\n */'));
+  // Placeholders in documentation are still skipped, and the name-based rule ignores comments.
+  assert.ok(!has('// const key = "AKIAIOSFODNN7EXAMPLE";'));
+  assert.ok(!has('// e.g. http://user:pass@host/ and redis://:secret@host and mongodb://myUser:myPassword@host'));
+  assert.ok(!has('// const password = "Zx81qLm4pQ";'));
+  assert.ok(!has('// the header is -----BEGIN PRIVATE KEY----- followed by base64'));
+});
+
+test('hardcoded-secret exempts test files by their path inside the scan root only', () => {
+  const src = "const password = 'Zx81qLm4pQ';";
+  const flagged = (file, relFile) => analyzeSource(src, { file, relFile }).some((f) => f.rule === 'hardcoded-secret');
+  assert.ok(!flagged('/proj/test/a.js', 'test/a.js'));
+  assert.ok(!flagged('/proj/src/a.test.js', 'src/a.test.js'));
+  assert.ok(!flagged('/proj/cypress/e2e/login.cy.ts', 'cypress/e2e/login.cy.ts'));
+  assert.ok(!flagged('/proj/src/Login.stories.tsx', 'src/Login.stories.tsx'));
+  assert.ok(!flagged('/proj/src/__fixtures__/user.js', 'src/__fixtures__/user.js'));
+  // Directories above the scan root do not count.
+  assert.ok(flagged('/home/me/test/proj/src/a.js', 'src/a.js'));
+  assert.ok(flagged('/home/runner/work/spec/spec/src/a.js', 'src/a.js'));
+  assert.ok(flagged('C:\\Users\\me\\spec\\proj\\a.js', 'a.js'));
+  // Without a relFile the path as given is used.
+  assert.ok(!analyzeSource(src, { file: 'test/a.js' }).some((f) => f.rule === 'hardcoded-secret'));
+  // Format-based secrets are still found in tests.
+  assert.ok(analyzeSource("const k = 'AS" + "IAABCDEFGHIJKLMNOP';", { file: '/p/test/a.js', relFile: 'test/a.js' }).length > 0);
+});
+
+test('hardcoded-secret ignores routes, rules, cookie names, enums and translated words', () => {
+  for (const src of [
+    "const API = { login: '/api/v1/login', token: '/api/v1/token' };",
+    "const rules = { password: 'required', token: 'string|required' };",
+    "const es = { password: 'Contrase\u00f1a' };",
+    "const sv = { password: 'L\u00f6senord' };",
+    "const nl = { password: 'wachtwoord' };",
+    "const SESSION_KEY = 'app.session.v2';",
+    "const csrf = 'csrftoken';",
+    "const session = 'sessionid';",
+    "const store = { token: './token.json', secret: '../secret' };",
+    "const names = { apiKey: 'api_key_v2', secretKey: 'SECRET_KEY' };",
+    "const messages = { password: 'Enter your password', secret: 'Secret is required' };",
+    'const x = { token: "1.2.3", session: "10.0.0.1" };',
+  ]) {
+    assert.ok(!has(src, 'a.js'), src);
+  }
+  assert.ok(!has("export enum Cookie { RefreshToken = 'refreshtoken', CsrfToken = 'csrf-token' }", 'a.ts'));
+});
+
+test('hardcoded-secret recognises credential shapes and common names', () => {
+  const positives = [
+    "createTransport({ auth: { user: 'a@b.c', pass: 'Zx81qLm4pQ' } });",
+    "const dbPass = 'Zx81qLm4pQ';",
+    "process.env.DB_PASS = 'Zx81qLm4pQ';",
+    "const pwd = 'Zx81qLm4pQ';",
+    "const password = 'hunter2';",
+    "const o = { password: '123456' };",
+    "app.use(session({ secret: 'keyboard cat' }));",
+    "cfg['password'] = 'Zx81qLm4pQ';",
+    "const password =\n  'Zx81qLm4pQ';",
+    "const o = {\n  secret:\n    'Zx81qLm4pQ',\n};",
+    "const stripeSecretKey = process.env.STRIPE_API_KEY || 'sk_" + 'li' + "ve_4eC39HqLyjWDarjtT1zdp7dc';",
+    "const apiKey = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';",
+    "const jwtSecret = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc';",
+    'const config = { clientSecret: `Zx81qLm4pQ-ab` };',
+    "const adminPassword = 'p@ssw0rd!';",
+    "this.refreshToken = 'a1b2c3d4e5f6a7b8c9d0';",
+    "const secret = process.env.JWT_SECRET || 'supersecretvalue';",
+  ];
+  for (const src of positives) assert.ok(has(src), src);
+  // Short passwords only count when the name is exactly password-like.
+  assert.ok(!has("const dbPassword = 'abc123';"));
+  assert.ok(!has("const apiKey = 'abc12';"));
+  // A phrase is not a passphrase when it reads like a label or a sentence.
+  assert.ok(!has("const o = { password: 'Mot de passe' };"));
+  assert.ok(!has("const o = { secret: 'the quick brown fox' };"));
+  assert.ok(!has("const o = { secret: 'Please try again' };"));
+  assert.ok(!has("const o = { token: 'two words' };")); // spaces only for password/secret names
+  // pass/pw names, but not words that merely end in them.
+  assert.ok(isSecretName('pass') && isSecretName('userPass') && isSecretName('db_pw'));
+  assert.ok(!isSecretName('bypass') && !isSecretName('compass') && !isSecretName('passed'));
 });
 
 test('hardcoded-secret detects credentials embedded in URLs', () => {

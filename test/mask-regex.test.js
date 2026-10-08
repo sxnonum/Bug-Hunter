@@ -99,3 +99,11 @@ test('regex flags and classes', () => {
   assert.equal(code('x = /a[/\\]]b/gi.test(s);'), 'x = /       /gi.test(s);');
   assert.equal(code('x = /a\\/b/u;'), 'x = /    /u;');
 });
+
+test('a regex may follow `default`, but `.default` divides', () => {
+  const m = (s) => mask(s).code;
+  assert.equal(m('export default /a(b/.test(s);\n'), 'export default /   /.test(s);\n');
+  assert.equal(m('const h = x.default / 2 / 3;\n'), 'const h = x.default / 2 / 3;\n');
+  assert.equal(m('const h = x?.default / 2 / 3;\n'), 'const h = x?.default / 2 / 3;\n');
+  assert.equal(m('switch (v) { default: /a(/.test(s); }\n'), 'switch (v) { default: /  /.test(s); }\n');
+});

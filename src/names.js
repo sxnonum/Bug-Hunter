@@ -12,7 +12,7 @@ function nameWords(name) {
 }
 
 const SECRET_LAST = new Set([
-  'password', 'passwd', 'pwd', 'passphrase', 'secret', 'secrets',
+  'password', 'passwd', 'pwd', 'pass', 'pw', 'passphrase', 'secret', 'secrets',
   'token', 'tokens', 'apikey', 'credential', 'credentials', 'nonce', 'salt', 'csrf', 'otp',
 ]);
 const KEY_QUALIFIERS = new Set([

@@ -131,3 +131,60 @@ test('many failed JSX attempts stay linear', () => {
   mask('x = <a>{'.repeat(40000));
   assert.ok(Number(process.hrtime.bigint() - t2) / 1e6 < 2000);
 });
+
+test('TSX type arguments after the element name are part of the tag', () => {
+  for (const open of ['<Table<Row> rows={rows}>', '<Select<Option, string> a="b">', '<A<B<C>> x>', '<Map<string, Array<number>>>', "<Pick<T, 'a' | 'b'>>", '<F<(x: number) => void>>']) {
+    const name = open.slice(1).split(/[<> ]/)[0];
+    const src = `const a = (\n  ${open}\n    <p>Don't call eval(x) here</p>\n  </${name}>\n);\neval(user);\n`;
+    const c = code(src, { jsx: true });
+    assert.ok(!c.includes('eval(x)'), open);
+    assert.ok(c.includes('eval(user)'), open);
+  }
+  const c = code("const a = <Table<Row> rows={rows}><p>Don't {eval(x)}</p></Table>;\n");
+  assert.ok(c.includes('eval(x)'));
+});
+
+test('a comparison is still not a type-argument list', () => {
+  const c = code('const ok = a < b && c > d;\nconst z = x < y > (1);\neval(q);\n');
+  assert.equal(c, 'const ok = a < b && c > d;\nconst z = x < y > (1);\neval(q);\n');
+});
+
+test('type arguments that are not a list fail the element instead of eating the file', () => {
+  const c = code('const a = <A<b + c>>x</A>;\neval(user);\n');
+  assert.ok(c.includes('eval(user)'));
+});
+
+test('generic arrows and function types do not use up the JSX budget', () => {
+  let src = '';
+  for (let i = 0; i < 40; i++) src += `export const id${i} = <T extends object>(x: T): T => x;\n`;
+  for (let i = 0; i < 40; i++) src += `export type Fn${i} = <T>(x: T) => T;\n`;
+  for (let i = 0; i < 1200; i++) src += `export function C${i}() {\n  return <p>Never call eval(x) here</p>;\n}\n`;
+  src += 'eval(user);\n';
+  const c = code(src);
+  assert.ok(!c.includes('eval(x)'));
+  assert.ok(c.includes('eval(user)'));
+  assert.equal(c.split('eval(user)').length, 2);
+});
+
+test('generic arrows are rejected even when a closing tag of that name exists later', () => {
+  const src = "const id = <T extends object>(x: T): T => x;\nconst a = <T>text 'it</T>;\neval(user);\n";
+  const c = code(src);
+  assert.ok(c.includes('<T extends object>(x: T): T => x;'));
+  assert.ok(!c.includes('text'));
+  assert.ok(c.includes('eval(user)'));
+});
+
+test('JSX text that starts with parentheses is still JSX', () => {
+  for (const text of ['(optional) eval(x)', '(a) and (b) eval(x)', '(see below): eval(x)']) {
+    const c = code(`const a = <Hint>${text}</Hint>;\neval(user);\n`);
+    assert.ok(!c.includes('eval(x)'), text);
+    assert.ok(c.includes('eval(user)'), text);
+  }
+});
+
+test('JSX may follow `export default`', () => {
+  const c = code("export default <p>Don't call eval(x) here</p>;\neval(user);\n");
+  assert.ok(!c.includes('eval(x)'));
+  assert.ok(c.includes('eval(user)'));
+  assert.ok(code("export default <></>;\neval(user);\n").includes('eval(user)'));
+});

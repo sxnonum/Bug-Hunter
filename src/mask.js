@@ -14,7 +14,7 @@
 
 const REGEX_PREV_WORDS = new Set([
   'return', 'typeof', 'case', 'in', 'of', 'delete', 'void', 'throw',
-  'new', 'else', 'do', 'yield', 'await', 'instanceof',
+  'new', 'else', 'do', 'yield', 'await', 'instanceof', 'default',
 ]);
 const BLOCK_WORDS = new Set(['else', 'do']); // keywords that take a block, not an object literal
 const HEADER_WORDS = new Set(['if', 'for', 'while', 'with']); // `kw (...)` is followed by a statement
@@ -167,6 +167,68 @@ function mask(src, { jsx = true } = {}) {
 
   // ---- JSX ----
 
+  // Where the last `</name` occurs, or -1. An opening tag whose name is never
+  // closed later cannot be an element (typically a generic arrow `<T extends X>(...)`),
+  // so it fails at once instead of scanning its "children" to the end of the file.
+  let closers = null;
+  function lastCloser(name) {
+    if (closers === null) {
+      closers = new Map();
+      const re = /<\/\s*([\w$.:\u0080-\uffff-]*)/g;
+      let m;
+      while ((m = re.exec(src)) !== null) closers.set(m[1], m.index);
+    }
+    const at = closers.get(name);
+    return at === undefined ? -1 : at;
+  }
+
+  // j is just past the `>` of an outermost opening tag. Does `(params) =>` or
+  // `(params): Type =>` follow, as it does for `<T extends X>(x: T) => x`?
+  function genericArrowAt(j) {
+    while (j < n && (src.charCodeAt(j) === 32 || (src.charCodeAt(j) >= 9 && src.charCodeAt(j) <= 13))) j++;
+    if (src.charCodeAt(j) !== 40) return false;
+    const limit = Math.min(n, j + 500);
+    let depth = 0;
+    for (; j < limit; j++) {
+      const c = src.charCodeAt(j);
+      if (c === 34 || c === 39) j = scanQuoted(j, c);
+      else if (c === 40) depth++;
+      else if (c === 41 && --depth === 0) break;
+    }
+    if (depth !== 0) return false;
+    j++;
+    while (j < n && (src.charCodeAt(j) === 32 || (src.charCodeAt(j) >= 9 && src.charCodeAt(j) <= 13))) j++;
+    if (src.charCodeAt(j) === 61 && src.charCodeAt(j + 1) === 62) return true;
+    if (src.charCodeAt(j) !== 58) return false;
+    const end = Math.min(n, j + 300);
+    for (j++; j < end; j++) { // a return type, up to the arrow
+      const c = src.charCodeAt(j);
+      if (c === 61) return src.charCodeAt(j + 1) === 62;
+      if (c === 59 || c === 123 || c === 125 || (c === 60 && src.charCodeAt(j + 1) === 47)) return false;
+    }
+    return false;
+  }
+
+  // k is at the `<` of a TSX type-argument list (`<Table<Row> rows={r}>`).
+  // Returns the index just past the matching `>`, or -1 if it is not one.
+  function jsxTypeArgs(k) {
+    const limit = Math.min(n, k + 1000);
+    let depth = 0;
+    for (let j = k; j < limit; j++) {
+      const c = src.charCodeAt(j);
+      if (c === 60) depth++;
+      else if (c === 62) {
+        if (--depth === 0) return j + 1;
+      }
+      else if (c === 61 && src.charCodeAt(j + 1) === 62) j++; // `=>` in a function type
+      else if (c === 34 || c === 39) j = scanQuoted(j, c);
+      else if (!(isWordCode(c) || c === 32 || (c >= 9 && c <= 13) || isHighSpace(c)
+          || c === 44 || c === 46 || c === 124 || c === 38 || c === 91 || c === 93
+          || c === 63 || c === 58 || c === 59 || c === 40 || c === 41 || c === 123 || c === 125)) return -1;
+    }
+    return -1;
+  }
+
   function jsxEnterCode() {
     tok(true, 123);
   }
@@ -222,8 +284,12 @@ function mask(src, { jsx = true } = {}) {
   function jsxRun(j, mode) {
     for (;;) {
       if (mode === TAG) { // j is at the `<`
-        const k = jsxName(j + 1);
+        let k = jsxName(j + 1);
         stack.push({ k: ELEMENT, name: src.slice(j + 1, k) });
+        if (k > j + 1 && src.charCodeAt(k) === 60) {
+          k = jsxTypeArgs(k);
+          if (k < 0) return jsxFail(j + 1);
+        }
         j = k;
         mode = ATTRS;
       } else if (mode === ATTRS) {
@@ -231,6 +297,9 @@ function mask(src, { jsx = true } = {}) {
         if (j >= n) return jsxFail(n);
         const c = src.charCodeAt(j);
         if (c === 62) { // >
+          const open = stack[stack.length - 1];
+          if (lastCloser(open.name) < j
+              || (stack[stack.length - 2].k === ROOT && genericArrowAt(j + 1))) return jsxFail(j);
           mode = CHILDREN;
           j++;
         } else if (c === 47 && src.charCodeAt(j + 1) === 62) { // />
@@ -355,7 +424,12 @@ function mask(src, { jsx = true } = {}) {
 
       switch (c) {
         case 40: // (
-          stack.push({ k: PAREN, header: prevWord !== '' && !wordProp && HEADER_WORDS.has(prevWord) });
+          // np: the nearest frame below that is not a paren, so `}` finds it in O(1)
+          stack.push({
+            k: PAREN,
+            header: prevWord !== '' && !wordProp && HEADER_WORDS.has(prevWord),
+            np: stack.length === 0 ? -1 : stack[stack.length - 1].k === PAREN ? stack[stack.length - 1].np : stack.length - 1,
+          });
           tok(true, c);
           break;
         case 41: { // )
@@ -374,7 +448,7 @@ function mask(src, { jsx = true } = {}) {
           break;
         case 125: { // }
           let k = stack.length - 1;
-          while (k >= 0 && stack[k].k === PAREN) k--; // drop unmatched parens
+          if (k >= 0 && stack[k].k === PAREN) k = stack[k].np; // drop unmatched parens
           const frame = k >= 0 && stack[k].k <= JSX_CHILD ? stack[k] : null;
           if (frame !== null) stack.length = k;
           if (frame === null || frame.k === BLOCK) {

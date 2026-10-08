@@ -8,8 +8,8 @@
   "keywords": ["static-analysis", "linter", "bugs", "security", "javascript", "typescript", "sarif"],
   "repository": { "type": "git", "url": "git+https://github.com/sxnonum/Bug-Hunter.git" },
   "scripts": {
-    "test": "node --test test/*.test.js",
-    "scan": "node bin/bughunter.js src bin"
+    "test": "node scripts/test.js",
+    "scan": "node bin/bughunter.js --fail-on info src bin scripts"
   },
   "engines": { "node": ">=20" },
   "license": "MIT"

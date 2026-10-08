@@ -175,7 +175,8 @@ test('minified and bundled files are skipped unless --include-minified', () => {
     ['app.min.js', 'minified'],
     ['bundle.js', 'minified'],
   ]);
-  assert.match(r.stderr, /^bughunter: skipped 2 minified\/bundled file\(s\) \(use --include-minified to scan them\)$/m);
+  assert.match(r.stderr, /^bughunter: skipped 2 minified\/bundled file\(s\): .*app\.min\.js.*bundle\.js.* \(use --include-minified to scan them\)$/m);
+  assert.match(run([dir]).stdout, /in 1 file, 2 skipped/);
   r = run(['--include-minified', '--format', 'json', dir]);
   assert.equal(r.status, 1);
   assert.equal(JSON.parse(r.stdout).filesScanned, 3);

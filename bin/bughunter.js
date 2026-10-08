@@ -23,7 +23,8 @@ Options:
   --fail-on <level>        Exit 1 if any finding is at or above this level (default: medium)
                            Counts every finding, including ones hidden by --min-severity
   --disable <rules>        Comma-separated rule ids to skip
-  --include-minified       Also scan minified/bundled files (skipped by default)
+  --include-minified       Also scan minified/bundled files found in directories (skipped by
+                           default; files named on the command line are always scanned)
   --config <path>          Read options from a JSON file (default: ./${DEFAULT_CONFIG} if present)
   --list-rules             Print all rules and exit
   -h, --help               Show this help
@@ -80,6 +81,7 @@ function loadConfig(file, required) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // editors and PowerShell 5 write a BOM
   } catch (err) {
     if (err.code === 'ENOENT' && !required) return {};
     throw new ConfigError(`cannot read config ${file}: ${err.code || err.message}`);
@@ -173,26 +175,33 @@ function main() {
     binary: 'binary file',
     'not-a-regular-file': 'not a regular file or directory',
   };
-  let minified = 0;
+  const minified = [];
   for (const s of result.skipped) {
-    if (s.reason === 'minified') minified++;
+    if (s.reason === 'minified') minified.push(s.file);
     else console.error(`bughunter: ${s.file}: skipped (${reasons[s.reason] || s.reason})`);
   }
-  if (minified) {
-    console.error(`bughunter: skipped ${minified} minified/bundled file(s) (use --include-minified to scan them)`);
+  if (minified.length) {
+    const names = minified.slice(0, 5).join(', ') + (minified.length > 5 ? ', ...' : '');
+    console.error(`bughunter: skipped ${minified.length} minified/bundled file(s): ${names} (use --include-minified to scan them)`);
   }
 
   if (result.errors.length) return 2;
   return result.findings.some((f) => severityRank(f.severity) >= failRank) ? 1 : 0;
 }
 
-// A reader that closes early (`| head -1`) is not an error worth reporting.
+// A reader that closes early (`| head -1`) is not an error worth reporting. Any other failure
+// (a full disk, a read-only descriptor) means the report is lost: say so and exit 2, not 1.
+let outputFailed = false;
 process.stdout.on('error', (err) => {
-  if (err.code !== 'EPIPE') throw err;
+  if (err.code === 'EPIPE') return;
+  if (!outputFailed) console.error(`bughunter: cannot write output: ${err.code || err.message}`);
+  outputFailed = true;
+  process.exitCode = 2;
 });
 
 try {
-  process.exitCode = main();
+  const code = main();
+  process.exitCode = outputFailed ? 2 : code;
 } catch (err) {
   console.error(`bughunter: internal error: ${(err && err.stack) || err}`);
   process.exitCode = 2;
