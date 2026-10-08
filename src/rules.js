@@ -725,6 +725,14 @@ const rules = [
         return strLines[idx] && strLines[idx][pos] === ' ' ? `${m[1]} comment` : null;
       }),
   },
+  {
+    // Findings are produced by analyze.js while it reads bughunter-disable comments; the entry
+    // exists so the rule is listed, can be disabled and appears in SARIF output.
+    id: 'invalid-directive',
+    severity: 'low',
+    description: 'bughunter-disable comment naming a rule that does not exist',
+    check: () => [],
+  },
 ];
 
 function indent(text) {

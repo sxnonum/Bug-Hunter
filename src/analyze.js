@@ -11,24 +11,39 @@ function severityRank(severity) {
   return SEVERITIES.indexOf(severity);
 }
 
-// Maps line number -> Set of rule ids ('*' = all) disabled by inline comments:
+// Reads inline suppressions from comments (a directive inside a string literal is ignored):
 //   foo(); // bughunter-disable-line no-eval
-//   // bughunter-disable-next-line loose-equality, parseint-radix
-function parseDirectives(rawLines) {
+//   // bughunter-disable-next-line loose-equality, parseint-radix -- reason goes after "--"
+// Returns { disabled: Map(line -> Set of rule ids, '*' = all), invalid: findings for unknown ids }.
+// An unknown id never widens to "all rules": a typo must not hide more than intended.
+function parseDirectives(rawLines, strLines, file) {
   const known = new Set(allRules.map((r) => r.id));
   const disabled = new Map();
+  const invalid = [];
   const add = (line, ids) => {
     if (!disabled.has(line)) disabled.set(line, new Set());
     for (const id of ids) disabled.get(line).add(id);
   };
   rawLines.forEach((text, idx) => {
     const m = DIRECTIVE.exec(text);
-    if (!m) return;
-    const named = (m[2].match(/[a-z][\w-]*/g) || []).filter((id) => known.has(id));
-    const ids = named.length ? named : ['*'];
+    if (!m || !strLines[idx] || strLines[idx][m.index] !== ' ') return; // not inside a comment
+    const listed = m[2].split(/--|\*\//)[0].split(/[\s,]+/).filter(Boolean);
+    const unknown = listed.filter((id) => !known.has(id));
+    const ids = listed.filter((id) => known.has(id));
+    for (const id of unknown) {
+      invalid.push({
+        rule: 'invalid-directive',
+        severity: 'low',
+        file,
+        line: idx + 1,
+        column: m.index + 1,
+        message: `Unknown rule "${id}" in bughunter-disable comment (see --list-rules; put a reason after "--")`,
+      });
+    }
+    if (listed.length === 0) ids.push('*');
     add(m[1] === 'line' ? idx + 1 : idx + 2, ids);
   });
-  return disabled;
+  return { disabled, invalid };
 }
 
 // TypeScript-only files cannot contain JSX, and `<T>expr` casts there look like JSX.
@@ -36,7 +51,9 @@ function allowsJsx(file) {
   return !/\.(?:d\.)?[cm]?ts$/i.test(file);
 }
 
-function analyzeSource(text, { file = '<input>', disabledRules = [] } = {}) {
+// `relFile` is the path relative to the scan root (the scanner supplies it); rules that exempt
+// test code look at it so a checkout that lives under /home/me/test/ is not mistaken for tests.
+function analyzeSource(text, { file = '<input>', relFile = file, disabledRules = [] } = {}) {
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   const { withStrings, code } = mask(text, { jsx: allowsJsx(file) });
 
@@ -60,6 +77,7 @@ function analyzeSource(text, { file = '<input>', disabledRules = [] } = {}) {
   const rawLines = split(text);
   const ctx = {
     file,
+    relFile,
     raw: text,
     rawLines,
     str: withStrings,
@@ -69,9 +87,9 @@ function analyzeSource(text, { file = '<input>', disabledRules = [] } = {}) {
     posOf,
   };
 
-  const inlineDisabled = parseDirectives(rawLines);
+  const { disabled: inlineDisabled, invalid } = parseDirectives(rawLines, ctx.strLines, file);
   const skip = new Set(disabledRules);
-  const findings = [];
+  const findings = skip.has('invalid-directive') ? [] : invalid;
 
   for (const rule of allRules) {
     if (skip.has(rule.id)) continue;
